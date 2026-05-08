@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# OS / IDE / cache / build artifacts
+# ---------------------------------------------------------------------------
+.cursor/
+.vscode/
+logs/
+log/
+cache/
+__pycache__/
+*.pyc
+
+# ---------------------------------------------------------------------------
+# Data file extensions (never push raw/processed data files)
+# ---------------------------------------------------------------------------
+*.csv
+*.dyna
+*.geo
+*.rel
+*.dbf
+*.prj
+*.sbn
+*.sbx
+*.shp
+*.shx
+*.cpg
+*.xlsx
+*.xls
+*.parquet
+*.pickle
+*.pkl
+
+# Large KG triple/index text files (tracked code uses *.py / *.md only)
+UrbanKG_data/UrbanKG/**/*.txt
+UrbanKG_Embedding_Model/data/**/*.txt
+UrbanKG_Embedding_Model/data/**/test
+UrbanKG_Embedding_Model/data/**/train
+UrbanKG_Embedding_Model/data/**/valid
+
+# ---------------------------------------------------------------------------
+# Keep folder structure for Meta_data / Processed_data, but exclude all their
+# files. Empty folders are preserved with a .gitkeep marker.
+# ---------------------------------------------------------------------------
+UrbanKG_data/Meta_data/**
+UrbanKG_data/Processed_data/**
+USTP_data/Meta_data/**
+USTP_data/Processed_data/**
+
+# Re-include the subdirectories themselves so Git can traverse into them
+!UrbanKG_data/Meta_data/**/
+!UrbanKG_data/Processed_data/**/
+!USTP_data/Meta_data/**/
+!USTP_data/Processed_data/**/
+
+# Always allow .gitkeep markers anywhere
+!**/.gitkeep
