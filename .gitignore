@@ -28,6 +28,9 @@ __pycache__/
 *.parquet
 *.pickle
 *.pkl
+*.npy
+*.pt
+*.html
 
 # Large KG triple/index text files (tracked code uses *.py / *.md only)
 UrbanKG_data/UrbanKG/**/*.txt
