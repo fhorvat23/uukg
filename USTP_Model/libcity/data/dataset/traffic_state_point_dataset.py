@@ -49,7 +49,10 @@ class TrafficStatePointDataset(TrafficStateDataset):
 
         Returns:
             dict: A dictionary containing relevant features of the dataset"""
+        # If KG vectors are already concatenated into each sample's last dim, omit
+        # node_embeddings so STGCN (and similar) does not concat twice.
+        node_emb_for_model = None if self.add_kg_embeddings else self.node_embeddings
         return {"scaler": self.scaler, "adj_mx": self.adj_mx, "ext_dim": self.ext_dim,
                 "num_nodes": self.num_nodes, "feature_dim": self.feature_dim,
                 "output_dim": self.output_dim, "num_batches": self.num_batches,
-                "node_embeddings": self.node_embeddings}
+                "node_embeddings": node_emb_for_model}

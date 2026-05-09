@@ -31,13 +31,15 @@ class TrafficStateDataset(AbstractDataset):
         self.normal_external = self.config.get('normal_external', False)
         self.add_time_in_day = self.config.get('add_time_in_day', False)
         self.add_day_in_week = self.config.get('add_day_in_week', False)
+        self.add_kg_embeddings = self.config.get('add_kg_embeddings', True)
         self.input_window = self.config.get('input_window', 12)
         self.output_window = self.config.get('output_window', 12)
         self.parameters_str = \
             str(self.dataset) + '_' + str(self.input_window) + '_' + str(self.output_window) + '_' \
             + str(self.train_rate) + '_' + str(self.eval_rate) + '_' + str(self.scaler_type) + '_' \
             + str(self.batch_size) + '_' + str(self.load_external) + '_' + str(self.add_time_in_day) + '_' \
-            + str(self.add_day_in_week) + '_' + str(self.pad_with_last_sample) + '_' \
+            + str(self.add_day_in_week) + '_' + str(self.add_kg_embeddings) + '_' \
+            + str(self.pad_with_last_sample) + '_' \
             + str(self.config.get('kg_model', 'none'))
         self.cache_file_name = os.path.join('./libcity/cache/dataset_cache/',
                                             'traffic_state_{}.npz'.format(self.parameters_str))
@@ -87,8 +89,13 @@ class TrafficStateDataset(AbstractDataset):
             self._load_rel()
         else:
             self.adj_mx = np.zeros((len(self.geo_ids), len(self.geo_ids)), dtype=np.float32)
-        # Load KG node embeddings after num_nodes is known from geo file
-        self.node_embeddings = self._load_kg_node_embeddings(self.num_nodes)
+        # Load KG node embeddings when kg_model is set. Whether they are fused into X
+        # is controlled by add_kg_embeddings; when False, models like STGCN can concat
+        # at forward and keep smaller cached arrays.
+        if self.kg_model is None:
+            self.node_embeddings = None
+        else:
+            self.node_embeddings = self._load_kg_node_embeddings(self.num_nodes)
 
     def _load_geo(self):
         """Load .geo file, format [geo_id, type, coordinates, properties (several columns)]"""
@@ -634,8 +641,68 @@ class TrafficStateDataset(AbstractDataset):
 
         return np.concatenate([region_emb, poi_emb, road_emb], axis=1)  # (num_nodes, 3*embed_dim)
 
+    def _append_kg_node_embeddings(self, data):
+        """Concatenate per-node KG embeddings on the last axis (``add_kg_embeddings`` + ``node_embeddings``).
+
+        Supports 3D point series (T, N, F), 4D grid (T, H, W, F), 4D OD (T, N, N, F), and 6D grid OD."""
+        if not self.add_kg_embeddings or self.node_embeddings is None:
+            return data
+        emb = np.asarray(self.node_embeddings, dtype=np.float32)
+        out = np.asarray(data, dtype=np.float32)
+        if out.ndim == 3:
+            t, n, _ = out.shape
+            if emb.shape[0] != n:
+                self._logger.warning(
+                    'KG append skipped: embedding rows {} != num_nodes {}'
+                    .format(emb.shape[0], n))
+                return data
+            tile = np.broadcast_to(emb[np.newaxis, :, :], (t, n, emb.shape[1]))
+            return np.concatenate([out, tile], axis=-1)
+        if out.ndim == 4:
+            t, a, b, _ = out.shape
+            if getattr(self, 'len_row', None) is not None and getattr(self, 'len_column', None) is not None \
+                    and a == self.len_row and b == self.len_column and emb.shape[0] == a * b:
+                grid = emb.reshape(a, b, -1)
+                tile = np.broadcast_to(grid[np.newaxis, ...], (t, a, b, grid.shape[-1]))
+                return np.concatenate([out, tile], axis=-1)
+            if a == b == emb.shape[0]:
+                n = a
+                e = emb
+                k = e.shape[1]
+                orig = np.broadcast_to(e[:, np.newaxis, :], (n, n, k))
+                dest = np.broadcast_to(e[np.newaxis, :, :], (n, n, k))
+                kg = np.concatenate([orig, dest], axis=-1)
+                tile = np.broadcast_to(kg[np.newaxis, ...], (t, n, n, kg.shape[-1]))
+                return np.concatenate([out, tile], axis=-1)
+            self._logger.warning(
+                'KG append skipped: unsupported 4D shape {} with embedding rows {}'
+                .format(out.shape, emb.shape[0]))
+            return data
+        if out.ndim == 6:
+            t, lr, lc, _, _, _ = out.shape
+            if emb.shape[0] != lr * lc:
+                self._logger.warning(
+                    'KG append skipped: embedding rows {} != grid size {}'
+                    .format(emb.shape[0], lr * lc))
+                return data
+            e = emb.reshape(lr, lc, -1)
+            k = e.shape[-1]
+            orig = np.broadcast_to(
+                e[:, :, np.newaxis, np.newaxis, :], (lr, lc, lr, lc, k))
+            dest = np.broadcast_to(
+                e[np.newaxis, np.newaxis, :, :, :], (lr, lc, lr, lc, k))
+            kg = np.concatenate([orig, dest], axis=-1)
+            tile = np.broadcast_to(kg[np.newaxis, ...], (t,) + kg.shape)
+            return np.concatenate([out, tile], axis=-1)
+        self._logger.warning(
+            'KG append skipped: ndim {} not supported'.format(out.ndim))
+        return data
+
     def _add_external_information_3d(self, df, ext_data=None):
-        """Add external information (day of week/day of week, time of day/time of day, external data)
+        """Add external information (time of day, day of week, optional .ext columns, optional KG embeddings).
+
+        Toggle with config: ``add_time_in_day``, ``add_day_in_week``, ``load_external`` (+ ``.ext`` file),
+        and ``add_kg_embeddings`` (uses ``node_embeddings`` from ``_load_kg_node_embeddings``).
 
         Args:
             df(np.ndarray): multidimensional array of traffic status data, (len_time, num_nodes, feature_dim)
@@ -677,17 +744,7 @@ class TrafficStateDataset(AbstractDataset):
                         data_ind = np.tile(data_ind, [1, num_nodes, 1]).transpose((2, 1, 0))
                         data_list.append(data_ind)
         data = np.concatenate(data_list, axis=-1)
-
-        # node_emb = self._load_kg_node_embeddings(num_nodes)
-        # if node_emb is not None:
-        #     new_data = np.empty(
-        #         (data.shape[0], num_nodes, data.shape[2] + node_emb.shape[1]),
-        #         dtype=np.float32)
-        #     for t in range(data.shape[0]):
-        #         new_data[t] = np.concatenate([data[t], node_emb], axis=1)
-        #     return new_data
-
-        return data
+        return self._append_kg_node_embeddings(data)
 
     def _add_external_information_4d(self, df, ext_data=None):
         """Add external information (day of week/day of week, time of day/time of day, external data)
@@ -732,7 +789,7 @@ class TrafficStateDataset(AbstractDataset):
                         data_ind = np.tile(data_ind, [1, len_row, len_column, 1]).transpose((3, 1, 2, 0))
                         data_list.append(data_ind)
         data = np.concatenate(data_list, axis=-1)
-        return data
+        return self._append_kg_node_embeddings(data)
 
     def _add_external_information_6d(self, df, ext_data=None):
         """Add external information (day of week/day of week, time of day/time of day, external data)
@@ -782,7 +839,7 @@ class TrafficStateDataset(AbstractDataset):
                             transpose((5, 1, 2, 3, 4, 0))
                         data_list.append(data_ind)
         data = np.concatenate(data_list, axis=-1)
-        return data
+        return self._append_kg_node_embeddings(data)
 
     def _generate_input_data(self, df):
         """Split the input according to the global parameters `input_window` and `output_window` to generate the tensor input required by the model,
@@ -838,11 +895,27 @@ class TrafficStateDataset(AbstractDataset):
             ext_data = self._load_ext()
         else:
             ext_data = None
+        fuse_extras = (
+            ext_data is not None
+            or self.add_time_in_day
+            or self.add_day_in_week
+            or (self.add_kg_embeddings and self.node_embeddings is not None)
+        )
         x_list, y_list = [], []
         for filename in data_files:
             df = self._load_dyna(filename)  # (len_time, ..., feature_dim)
-            if self.load_external:
+            if fuse_extras:
                 df = self._add_external_information(df, ext_data)
+            print()
+            print()
+            print()
+            print()
+            print("df shape:")
+            print(df.shape)
+            print()
+            print()
+            print()
+            print()
             x, y = self._generate_input_data(df)
             # x: (num_samples, input_length, ..., input_dim)
             # y: (num_samples, output_length, ..., output_dim)

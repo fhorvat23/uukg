@@ -107,6 +107,21 @@ class ConfigParser(object):
                 for key in x:
                     if key not in self.config:
                         self.config[key] = x[key]
+        # Model JSON is loaded before `data/<dataset_class>.json`. Model files often set
+        # `add_time_in_day` / `add_day_in_week` / `load_external` to false, which blocks
+        # the dataset-class file from applying (merge uses "only if key missing").
+        # Re-apply those data-pipeline keys from the dataset-class JSON so
+        # `TrafficStatePointDataset.json` (etc.) remains authoritative for fusion flags.
+        _dataset_class_cfg_path = './libcity/config/data/{}.json'.format(
+            self.config['dataset_class'])
+        if os.path.exists(_dataset_class_cfg_path):
+            with open(_dataset_class_cfg_path, 'r') as f:
+                _ds_class = json.load(f)
+            for _key in (
+                    'add_time_in_day', 'add_day_in_week', 'load_external',
+                    'normal_external', 'ext_scaler', 'add_kg_embeddings'):
+                if _key in _ds_class:
+                    self.config[_key] = _ds_class[_key]
         # Load data set config.json
         with open('./raw_data/{}/config.json'.format(self.config['dataset']), 'r') as f:
             x = json.load(f)

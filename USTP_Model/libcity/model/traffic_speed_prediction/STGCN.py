@@ -221,12 +221,15 @@ class STGCN(AbstractTrafficStateModel):
             self.register_buffer('node_embeddings',
                                  torch.FloatTensor(node_emb))
             self._logger.info('STGCN: using node embeddings, emb_dim={}, '
-                              'total input_dim={}'.format(
-                                  self.node_emb_dim,
-                                  self.feature_dim + self.node_emb_dim))
+                                'total input_dim={}'.format(
+                                    self.node_emb_dim,
+                                    self.feature_dim + self.node_emb_dim))
         else:
             self.node_emb_dim = 0
             self.node_embeddings = None
+            self._logger.info('STGCN: NOT using node embeddings,  '
+                                'total input_dim={}'.format(
+                                    self.feature_dim))
 
         # node_emb_proj_dim: the KG embeddings (e.g. 96-dim) are projected down to this
         # many channels before being concatenated with traffic features.  Keeping this
