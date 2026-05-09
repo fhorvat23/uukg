@@ -37,7 +37,8 @@ class TrafficStateDataset(AbstractDataset):
             str(self.dataset) + '_' + str(self.input_window) + '_' + str(self.output_window) + '_' \
             + str(self.train_rate) + '_' + str(self.eval_rate) + '_' + str(self.scaler_type) + '_' \
             + str(self.batch_size) + '_' + str(self.load_external) + '_' + str(self.add_time_in_day) + '_' \
-            + str(self.add_day_in_week) + '_' + str(self.pad_with_last_sample)
+            + str(self.add_day_in_week) + '_' + str(self.pad_with_last_sample) + '_' \
+            + str(self.config.get('kg_model', 'none'))
         self.cache_file_name = os.path.join('./libcity/cache/dataset_cache/',
                                             'traffic_state_{}.npz'.format(self.parameters_str))
         self.cache_file_folder = './libcity/cache/dataset_cache/'
@@ -62,6 +63,9 @@ class TrafficStateDataset(AbstractDataset):
         self.calculate_weight_adj = self.config.get('calculate_weight_adj', False)
         self.weight_adj_epsilon = self.config.get('weight_adj_epsilon', 0.1)
         self.distance_inverse = self.config.get('distance_inverse', False)
+        self.kg_model = self.config.get('kg_model', None)
+        self.embed_dir = self.config.get(
+            'embed_dir', '../UrbanKG_Embedding_Model/UrbanKG_Embedding')
 
         # initialization
         self.data = None
@@ -73,6 +77,7 @@ class TrafficStateDataset(AbstractDataset):
         self.ext_dim = 0
         self.num_nodes = 0
         self.num_batches = 0
+        self.node_embeddings = None
         self._logger = getLogger()
         if os.path.exists(self.data_path + self.geo_file + '.geo'):
             self._load_geo()
@@ -82,6 +87,8 @@ class TrafficStateDataset(AbstractDataset):
             self._load_rel()
         else:
             self.adj_mx = np.zeros((len(self.geo_ids), len(self.geo_ids)), dtype=np.float32)
+        # Load KG node embeddings after num_nodes is known from geo file
+        self.node_embeddings = self._load_kg_node_embeddings(self.num_nodes)
 
     def _load_geo(self):
         """Load .geo file, format [geo_id, type, coordinates, properties (several columns)]"""
@@ -555,6 +562,78 @@ class TrafficStateDataset(AbstractDataset):
             np.ndarray: fused external data and traffic status data"""
         raise NotImplementedError('Please implement the function `_add_external_information()`.')
 
+    def _load_kg_node_embeddings(self, num_nodes):
+        """Load region, POI, and road KG embeddings and aggregate them to the node (region) level.
+
+        The city prefix is derived from the first 3 characters of ``self.dataset``
+        (e.g. 'NYC' from 'NYCTaxi20200406').  The KG model name comes from
+        ``self.kg_model`` (e.g. 'RefH'), producing filenames like
+        ``NYC_RefH_region_embeddings.npy``.
+
+        POI and road embeddings are stored per-entity with the region_id appended as
+        the last column.  They are mean-pooled to region level before concatenation.
+
+        Args:
+            num_nodes (int): number of spatial nodes in the dataset
+
+        Returns:
+            np.ndarray: shape (num_nodes, 3 * embed_dim) concatenating
+                [region_emb | poi_emb | road_emb], or None if kg_model is not set."""
+        if self.kg_model is None:
+            return None
+
+        city = self.dataset[:3]  # 'NYC' or 'CHI'
+        city_dir = os.path.join(self.embed_dir, city, self.kg_model)
+        prefix = '{}_{}_'.format(city, self.kg_model)
+
+        region_path = os.path.join(city_dir, '{}region_embeddings.npy'.format(prefix))
+        poi_path    = os.path.join(city_dir, '{}poi_embeddings.npy'.format(prefix))
+        road_path   = os.path.join(city_dir, '{}road_embeddings.npy'.format(prefix))
+
+        for p in (region_path, poi_path, road_path):
+            if not os.path.exists(p):
+                raise FileNotFoundError(
+                    'KG embedding file not found: {}. '
+                    'Run get_embedding.py with --model {} --dataset {} first.'
+                    .format(p, self.kg_model, city))
+
+        # Region embeddings: (num_regions, embed_dim) — infer dim from file
+        region_raw = np.load(region_path).astype(np.float32)
+        embed_dim = region_raw.shape[1]
+        region_emb = np.zeros((num_nodes, embed_dim), dtype=np.float32)
+        n = min(region_raw.shape[0], num_nodes)
+        region_emb[:n] = region_raw[:n]
+
+        # POI embeddings: (num_pois, embed_dim + 1), last col = region_id
+        poi_raw = np.load(poi_path).astype(np.float32)
+        poi_emb = np.zeros((num_nodes, embed_dim), dtype=np.float32)
+        poi_counts = np.zeros(num_nodes, dtype=np.int32)
+        for row in poi_raw:
+            rid = int(row[embed_dim])
+            if 0 <= rid < num_nodes:
+                poi_emb[rid] += row[:embed_dim]
+                poi_counts[rid] += 1
+        mask = poi_counts > 0
+        poi_emb[mask] /= poi_counts[mask, None]
+
+        # Road embeddings: (num_roads, embed_dim + 1), last col = region_id
+        road_raw = np.load(road_path).astype(np.float32)
+        road_emb = np.zeros((num_nodes, embed_dim), dtype=np.float32)
+        road_counts = np.zeros(num_nodes, dtype=np.int32)
+        for row in road_raw:
+            rid = int(row[embed_dim])
+            if 0 <= rid < num_nodes:
+                road_emb[rid] += row[:embed_dim]
+                road_counts[rid] += 1
+        mask = road_counts > 0
+        road_emb[mask] /= road_counts[mask, None]
+
+        self._logger.info(
+            'Loaded KG embeddings: model={}, city={}, embed_dim={}, '
+            'total_node_dim={}'.format(self.kg_model, city, embed_dim, 3 * embed_dim))
+
+        return np.concatenate([region_emb, poi_emb, road_emb], axis=1)  # (num_nodes, 3*embed_dim)
+
     def _add_external_information_3d(self, df, ext_data=None):
         """Add external information (day of week/day of week, time of day/time of day, external data)
 
@@ -598,63 +677,17 @@ class TrafficStateDataset(AbstractDataset):
                         data_ind = np.tile(data_ind, [1, num_nodes, 1]).transpose((2, 1, 0))
                         data_list.append(data_ind)
         data = np.concatenate(data_list, axis=-1)
-        
-        EMBED_DIR = "./UrbanKG_Embedding_Model/UrbanKG_Embedding/NYC"
-        EMBED_DIM = 32
-        
-        # 1. Region embeddings: already (num_regions, EMBED_DIM), aligned to node order
-        region_emb = np.load(os.path.join(EMBED_DIR, "NYC_region_embeddings.npy"))
-        # Guard: if the npy has fewer rows than num_nodes (e.g. some regions missing),
-        # pad with zeros so indexing never goes out of bounds.
-        region_emb_aligned = np.zeros((num_nodes, EMBED_DIM), dtype=np.float32)
-        region_emb_aligned[:region_emb.shape[0]] = region_emb[:num_nodes]
-        # 2. POI embeddings: (num_pois, EMBED_DIM + 1), last col = region_id
-        poi_raw = np.load(os.path.join(EMBED_DIR, "NYC_poi_embeddings.npy"))
-        poi_emb_per_region = np.zeros((num_nodes, EMBED_DIM), dtype=np.float32)
-        poi_counts = np.zeros(num_nodes, dtype=np.int32)
-        for row in poi_raw:
-            rid = int(row[EMBED_DIM])          # region_id is the last column
-            if 0 <= rid < num_nodes:
-                poi_emb_per_region[rid] += row[:EMBED_DIM]
-                poi_counts[rid] += 1
-        # Mean-pool; nodes with no POIs stay at zero
-        nonzero = poi_counts > 0
-        poi_emb_per_region[nonzero] /= poi_counts[nonzero, None]
-        # 3. Road embeddings: same structure as POI
-        road_raw = np.load(os.path.join(EMBED_DIR, "NYC_road_embeddings.npy"))
-        road_emb_per_region = np.zeros((num_nodes, EMBED_DIM), dtype=np.float32)
-        road_counts = np.zeros(num_nodes, dtype=np.int32)
-        for row in road_raw:
-            rid = int(row[EMBED_DIM])
-            if 0 <= rid < num_nodes:
-                road_emb_per_region[rid] += row[:EMBED_DIM]
-                road_counts[rid] += 1
-        nonzero = road_counts > 0
-        road_emb_per_region[nonzero] /= road_counts[nonzero, None]
-        # 4. Concatenate all three: (num_nodes, 3*EMBED_DIM)
-        node_emb = np.concatenate(
-            [region_emb_aligned, poi_emb_per_region, road_emb_per_region], axis=1
-        )  # (num_nodes, 96)
-        # 5. Tile across time: repeat for every timestep
-        new_data = np.zeros(
-            (data.shape[0], data.shape[1], data.shape[2] + node_emb.shape[1]),
-            dtype=np.float32
-        )
-        for t in range(data.shape[0]):
-            new_data[t] = np.concatenate([data[t], node_emb], axis=1)
-        return new_data
 
-        # region_embeddings = np.load("XXX/NYC_area_embeddingn.npy")
-        # region_embeddings_plus = np.zeros([260, 32])
-        # for i in range(region_embeddings.shape[0]):
-        #     region_embeddings_plus[i] = region_embeddings[i]
+        # node_emb = self._load_kg_node_embeddings(num_nodes)
+        # if node_emb is not None:
+        #     new_data = np.empty(
+        #         (data.shape[0], num_nodes, data.shape[2] + node_emb.shape[1]),
+        #         dtype=np.float32)
+        #     for t in range(data.shape[0]):
+        #         new_data[t] = np.concatenate([data[t], node_emb], axis=1)
+        #     return new_data
 
-        # new_data = np.zeros([data.shape[0], data.shape[1], data.shape[2] + region_embeddings_plus.shape[1]])
-        # for k in range(data.shape[0]):
-        #     new_data[k] = np.concatenate([data[k], region_embeddings_plus], axis=1)
-        # return new_data
-        
-        # return data
+        return data
 
     def _add_external_information_4d(self, df, ext_data=None):
         """Add external information (day of week/day of week, time of day/time of day, external data)
@@ -699,17 +732,6 @@ class TrafficStateDataset(AbstractDataset):
                         data_ind = np.tile(data_ind, [1, len_row, len_column, 1]).transpose((3, 1, 2, 0))
                         data_list.append(data_ind)
         data = np.concatenate(data_list, axis=-1)
-
-        # region_embeddings = np.load("XXX/NYC_area_embeddingn.npy")
-        # region_embeddings_plus = np.zeros([260, 32])
-        # for i in range(region_embeddings.shape[0]):
-        #     region_embeddings_plus[i] = region_embeddings[i]
-
-        # new_data = np.zeros([data.shape[0], data.shape[1], data.shape[2] + region_embeddings_plus.shape[1]])
-        # for k in range(data.shape[0]):
-        #     new_data[k] = np.concatenate([data[k], region_embeddings_plus], axis=1)
-        # return new_data
-        
         return data
 
     def _add_external_information_6d(self, df, ext_data=None):

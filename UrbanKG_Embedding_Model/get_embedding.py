@@ -256,14 +256,15 @@ def get_Road_embedding(grid_KG_id_path, entity_final_embedddings, save_path):
 args = parser.parse_args()
 entity_final_embedddings = get_embeddings(args)
 
-embedding_save_dir = os.path.join("./UrbanKG_Embedding", args.dataset)
+embedding_save_dir = os.path.join("./UrbanKG_Embedding", args.dataset, f"{args.model}")
 os.makedirs(embedding_save_dir, exist_ok=True)
 
 region_map_csv, poi_map_csv, road_map_csv = build_kg_mapping_files(args.dataset)
 
-region_embedding_npy = os.path.join(embedding_save_dir, f"{args.dataset}_region_embeddings.npy")
-poi_embedding_npy = os.path.join(embedding_save_dir, f"{args.dataset}_poi_embeddings.npy")
-road_embedding_npy = os.path.join(embedding_save_dir, f"{args.dataset}_road_embeddings.npy")
+prefix = f"{args.dataset}_{args.model}_"
+region_embedding_npy = os.path.join(embedding_save_dir, f"{prefix}region_embeddings.npy")
+poi_embedding_npy    = os.path.join(embedding_save_dir, f"{prefix}poi_embeddings.npy")
+road_embedding_npy   = os.path.join(embedding_save_dir, f"{prefix}road_embeddings.npy")
 
 get_region_embeddings(region_map_csv, entity_final_embedddings, region_embedding_npy)
 get_POI_embedding(poi_map_csv, entity_final_embedddings, poi_embedding_npy)

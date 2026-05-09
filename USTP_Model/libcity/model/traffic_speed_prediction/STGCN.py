@@ -215,6 +215,41 @@ class STGCN(AbstractTrafficStateModel):
         self._scaler = self.data_feature.get('scaler')
         self._logger = getLogger()
 
+        node_emb = data_feature.get('node_embeddings', None)
+        if node_emb is not None:
+            self.node_emb_dim = node_emb.shape[1]
+            self.register_buffer('node_embeddings',
+                                 torch.FloatTensor(node_emb))
+            self._logger.info('STGCN: using node embeddings, emb_dim={}, '
+                              'total input_dim={}'.format(
+                                  self.node_emb_dim,
+                                  self.feature_dim + self.node_emb_dim))
+        else:
+            self.node_emb_dim = 0
+            self.node_embeddings = None
+
+        # node_emb_proj_dim: the KG embeddings (e.g. 96-dim) are projected down to this
+        # many channels before being concatenated with traffic features.  Keeping this
+        # small (default 8) avoids widening the conv stack significantly.
+        # self.node_emb_proj_dim = config.get('node_emb_proj_dim', 8)
+
+        # node_emb = data_feature.get('node_embeddings', None)
+        # if node_emb is not None:
+        #     raw_emb_dim = node_emb.shape[1]
+        #     self.register_buffer('node_embeddings',
+        #                          torch.FloatTensor(node_emb))
+        #     self.node_emb_proj = nn.Linear(raw_emb_dim, self.node_emb_proj_dim)
+        #     self._logger.info(
+        #         'STGCN: KG embeddings enabled — raw_dim={}, projected_dim={}, '
+        #         'total input_dim={}'.format(
+        #             raw_emb_dim, self.node_emb_proj_dim,
+        #             self.feature_dim + self.node_emb_proj_dim))
+        # else:
+        #     self.node_emb_proj_dim = 0
+        #     self.node_embeddings = None
+        #     self.node_emb_proj = None
+
+        
         self.Ks = config.get('Ks', 3)
         self.Kt = config.get('Kt', 3)
         self.blocks = config.get('blocks', [[1, 32, 64], [64, 32, 128]])
@@ -226,7 +261,10 @@ class STGCN(AbstractTrafficStateModel):
         if self.train_mode.lower() not in ['quick', 'full']:
             raise ValueError('STGCN_train_mode must be `quick` or `full`.')
         self._logger.info('You select {} mode to train STGCN model.'.format(self.train_mode))
-        self.blocks[0][0] = self.feature_dim
+        
+        self.blocks[0][0] = self.feature_dim + self.node_emb_dim
+        # self.blocks[0][0] = self.feature_dim + self.node_emb_proj_dim
+        
         if self.input_window - len(self.blocks) * 2 * (self.Kt - 1) <= 0:
             raise ValueError('Input_window must bigger than 4*(Kt-1) for 2 STConvBlock'
                              ' have 4 kt-kernel convolutional layer.')
@@ -258,7 +296,17 @@ class STGCN(AbstractTrafficStateModel):
 
     def forward(self, batch):
         x = batch['X']  # (batch_size, input_length, num_nodes, feature_dim)
-        x = x.permute(0, 3, 1, 2)  # (batch_size, feature_dim, input_length, num_nodes)
+        if self.node_embeddings is not None:
+            # Project (N, raw_dim) -> (N, proj_dim), then broadcast across batch and time
+            
+            # emb = self.node_emb_proj(self.node_embeddings)          # (N, proj_dim)
+            # emb = emb.unsqueeze(0).unsqueeze(0).expand(
+            #     x.size(0), x.size(1), -1, -1)                       # (B, T, N, proj_dim)
+            emb = self.node_embeddings.unsqueeze(0).unsqueeze(0).expand(
+                x.size(0), x.size(1), -1, -1)                       # (B, T, N, proj_dim)
+            
+            x = torch.cat([x, emb], dim=-1)                         # (B, T, N, feature_dim+proj_dim)
+        x = x.permute(0, 3, 1, 2)  # (batch_size, feature_dim+emb_dim, input_length, num_nodes)
         x_st1 = self.st_conv1(x)   # (batch_size, c[2](64), input_length-kt+1-kt+1, num_nodes)
         x_st2 = self.st_conv2(x_st1)  # (batch_size, c[2](128), input_length-kt+1-kt+1-kt+1-kt+1, num_nodes)
         outputs = self.output(x_st2)  # (batch_size, output_dim(1), output_length(1), num_nodes)

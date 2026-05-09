@@ -12,7 +12,7 @@ import numpy as np
 log = './log/'
 
 if __name__ == '__main__':
-    total = 1
+    total = 10
     for i in range(total):
         seed = random.randint(0, 10000)
 
@@ -32,6 +32,14 @@ if __name__ == '__main__':
                             help='whether re-train model if the model is trained before')
         parser.add_argument('--exp_id', type=str, default=None, help='id of experiment')
         parser.add_argument('--seed', type=int, default=seed, help='random seed')
+        parser.add_argument('--kg_model', type=str, default=None,
+                            help='KG embedding model name used to build node embeddings '
+                                 '(e.g. RefH, RotH, GIE). When set, the files '
+                                 '{CITY}_{kg_model}_region/poi/road_embeddings.npy are '
+                                 'fused into the input features. Leave unset to skip fusion.')
+        parser.add_argument('--embed_dir', type=str, default=None,
+                            help='Base directory that contains per-city KG embedding folders '
+                                 '(default: ../UrbanKG_Embedding_Model/UrbanKG_Embedding)')
         # Add other optional arguments
         add_general_args(parser)
         # Parse arguments
