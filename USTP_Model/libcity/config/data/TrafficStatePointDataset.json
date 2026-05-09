@@ -11,7 +11,7 @@
   "ext_scaler": "none",
   "input_window": 12,
   "output_window": 12,
-  "add_time_in_day": true,
-  "add_day_in_week": true,
+  "add_time_in_day": false,
+  "add_day_in_week": false,
   "add_kg_embeddings": false
 }
