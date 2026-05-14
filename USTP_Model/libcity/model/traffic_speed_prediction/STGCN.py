@@ -148,7 +148,8 @@ class SpatioConvLayer(nn.Module):
         bound = 1 / math.sqrt(fan_in)
         init.uniform_(self.b, -bound, bound)
 
-    def forward(self, x):
+    # def forward(self, x):
+    def forward(self, x, node_bias=None):
         # Lk: (Ks, num_nodes, num_nodes)
         # x:  (batch_size, c_in, input_length, num_nodes)
         # x_c: (batch_size, c_in, input_length, Ks, num_nodes)
@@ -156,6 +157,11 @@ class SpatioConvLayer(nn.Module):
         # x_gc: (batch_size, c_out, input_length, num_nodes)
         x_c = torch.einsum("knm,bitm->bitkn", self.Lk, x)  # delete num_nodes(n)
         x_gc = torch.einsum("iok,bitkn->botn", self.theta, x_c) + self.b  # delete Ks(k) c_in(i)
+        
+        if node_bias is not None:
+            # node_bias: (1, c_out, 1, num_nodes) — static node identity injected after spatial agg
+            x_gc = x_gc + node_bias
+            
         x_in = self.align(x)  # (batch_size, c_out, input_length, num_nodes)
         return torch.relu(x_gc + x_in)  # residual connection
 
@@ -169,10 +175,15 @@ class STConvBlock(nn.Module):
         self.ln = nn.LayerNorm([n, c[2]])
         self.dropout = nn.Dropout(p)
 
-    def forward(self, x):  # x: (batch_size, feature_dim/c[0], input_length, num_nodes)
-        x_t1 = self.tconv1(x)    # (batch_size, c[1], input_length-kt+1, num_nodes)
-        x_s = self.sconv(x_t1)   # (batch_size, c[1], input_length-kt+1, num_nodes)
-        x_t2 = self.tconv2(x_s)  # (batch_size, c[2], input_length-kt+1-kt+1, num_nodes)
+
+    # def forward(self, x):  # x: (batch_size, feature_dim/c[0], input_length, num_nodes)
+    #     x_t1 = self.tconv1(x)    # (batch_size, c[1], input_length-kt+1, num_nodes)
+    #     x_s = self.sconv(x_t1)   # (batch_size, c[1], input_length-kt+1, num_nodes)
+    #     x_t2 = self.tconv2(x_s)  # (batch_size, c[2], input_length-kt+1-kt+1, num_nodes)
+    def forward(self, x, node_bias=None):  # x: (batch_size, feature_dim/c[0], input_length, num_nodes)
+        x_t1 = self.tconv1(x)              # (batch_size, c[1], input_length-kt+1, num_nodes)
+        x_s = self.sconv(x_t1, node_bias)  # (batch_size, c[1], input_length-kt+1, num_nodes)
+        x_t2 = self.tconv2(x_s)            # (batch_size, c[2], input_length-kt+1-kt+1, num_nodes)
         x_ln = self.ln(x_t2.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         return self.dropout(x_ln)
 
@@ -215,42 +226,62 @@ class STGCN(AbstractTrafficStateModel):
         self._scaler = self.data_feature.get('scaler')
         self._logger = getLogger()
 
+        # KG embeddings are injected as a learned additive node bias inside each
+        # SpatioConvLayer — after graph aggregation but before the residual add.
+        # This keeps the temporal convolutions free of static (time-constant)
+        # channels, which would produce zero temporal gradient and hurt learning.
+        # The raw embeddings are L2-normalised so all KG models enter at the same
+        # scale; projection dims are set to match the spatial hidden width of each
+        # STConvBlock so no extra hyperparameter is needed.
+        
+        # if node_emb is not None:
+        #     self.node_emb_dim = node_emb.shape[1]
+        #     self.register_buffer('node_embeddings',
+        #                          torch.FloatTensor(node_emb))
+        #     self._logger.info('STGCN: using node embeddings, emb_dim={}, '
+        #                         'total input_dim={}'.format(
+        #                             self.node_emb_dim,
+        #                             self.feature_dim + self.node_emb_dim))
         node_emb = data_feature.get('node_embeddings', None)
-        if node_emb is not None:
-            self.node_emb_dim = node_emb.shape[1]
-            self.register_buffer('node_embeddings',
-                                 torch.FloatTensor(node_emb))
-            self._logger.info('STGCN: using node embeddings, emb_dim={}, '
-                                'total input_dim={}'.format(
-                                    self.node_emb_dim,
-                                    self.feature_dim + self.node_emb_dim))
+        self._use_node_emb = node_emb is not None
+        if self._use_node_emb:
+            raw_emb_dim = node_emb.shape[1]
+            emb_tensor = F.normalize(torch.FloatTensor(node_emb), p=2, dim=1)
+            self.register_buffer('node_embeddings', emb_tensor)
+            self._logger.info(
+                'STGCN: KG node-bias enabled — raw_emb_dim={}, '
+                'injection point: SpatioConvLayer outputs'.format(raw_emb_dim))
         else:
-            self.node_emb_dim = 0
             self.node_embeddings = None
             self._logger.info('STGCN: NOT using node embeddings,  '
                                 'total input_dim={}'.format(
                                     self.feature_dim))
+            # self.node_emb_dim = 0
+            # node_emb_proj_dim: the KG embeddings (e.g. 96-dim) are projected down to this
+            # many channels before being concatenated with traffic features.  Keeping this
+            # small (default 8) avoids widening the conv stack significantly.
+            # self.node_emb_proj_dim = config.get('node_emb_proj_dim', 8)
 
-        # node_emb_proj_dim: the KG embeddings (e.g. 96-dim) are projected down to this
-        # many channels before being concatenated with traffic features.  Keeping this
-        # small (default 8) avoids widening the conv stack significantly.
-        # self.node_emb_proj_dim = config.get('node_emb_proj_dim', 8)
-
-        # node_emb = data_feature.get('node_embeddings', None)
-        # if node_emb is not None:
-        #     raw_emb_dim = node_emb.shape[1]
-        #     self.register_buffer('node_embeddings',
-        #                          torch.FloatTensor(node_emb))
-        #     self.node_emb_proj = nn.Linear(raw_emb_dim, self.node_emb_proj_dim)
-        #     self._logger.info(
-        #         'STGCN: KG embeddings enabled — raw_dim={}, projected_dim={}, '
-        #         'total input_dim={}'.format(
-        #             raw_emb_dim, self.node_emb_proj_dim,
-        #             self.feature_dim + self.node_emb_proj_dim))
-        # else:
-        #     self.node_emb_proj_dim = 0
-        #     self.node_embeddings = None
-        #     self.node_emb_proj = None
+            # node_emb = data_feature.get('node_embeddings', None)
+            # if node_emb is not None:
+            #     raw_emb_dim = node_emb.shape[1]
+            #     self.register_buffer('node_embeddings',
+            #                          torch.FloatTensor(node_emb))
+            #     self.node_emb_proj = nn.Linear(raw_emb_dim, self.node_emb_proj_dim)
+            #     self._logger.info(
+            #         'STGCN: KG embeddings enabled — raw_dim={}, projected_dim={}, '
+            #         'total input_dim={}'.format(
+            #             raw_emb_dim, self.node_emb_proj_dim,
+            #             self.feature_dim + self.node_emb_proj_dim))
+            # else:
+            #     self.node_emb_proj_dim = 0
+            #     self.node_embeddings = None
+            #     self.node_emb_proj = None
+        
+            raw_emb_dim = 0
+            self._logger.info('STGCN: NOT using node embeddings, '
+                              'input_dim={}'.format(self.feature_dim))
+        self._raw_emb_dim = raw_emb_dim
 
         
         self.Ks = config.get('Ks', 3)
@@ -265,9 +296,10 @@ class STGCN(AbstractTrafficStateModel):
             raise ValueError('STGCN_train_mode must be `quick` or `full`.')
         self._logger.info('You select {} mode to train STGCN model.'.format(self.train_mode))
         
-        self.blocks[0][0] = self.feature_dim + self.node_emb_dim
+        # self.blocks[0][0] = self.feature_dim + self.node_emb_dim
         # self.blocks[0][0] = self.feature_dim + self.node_emb_proj_dim
-        
+        self.blocks[0][0] = self.feature_dim  # temporal conv input unchanged
+
         if self.input_window - len(self.blocks) * 2 * (self.Kt - 1) <= 0:
             raise ValueError('Input_window must bigger than 4*(Kt-1) for 2 STConvBlock'
                              ' have 4 kt-kernel convolutional layer.')
@@ -297,23 +329,54 @@ class STGCN(AbstractTrafficStateModel):
         self.output = OutputLayer(self.blocks[1][2], self.input_window - len(self.blocks) * 2
                                   * (self.Kt - 1), self.num_nodes, self.output_dim)
 
+        # One linear projection per STConvBlock: maps raw embedding → spatial hidden dim.
+        # These are the only parameters added by KG embeddings; they leave temporal
+        # convolutions and the input dimension completely untouched.
+        if self._use_node_emb:
+            self.node_emb_proj1 = nn.Linear(self._raw_emb_dim, self.blocks[0][1], bias=False)
+            self.node_emb_proj2 = nn.Linear(self._raw_emb_dim, self.blocks[1][1], bias=False)
+            self._logger.info(
+                'STGCN: node-bias projections - '
+                'proj1: {}->{}, proj2: {}->{}'.format(
+                    self._raw_emb_dim, self.blocks[0][1],
+                    self._raw_emb_dim, self.blocks[1][1]))
+
     def forward(self, batch):
         x = batch['X']  # (batch_size, input_length, num_nodes, feature_dim)
-        if self.node_embeddings is not None:
-            # Project (N, raw_dim) -> (N, proj_dim), then broadcast across batch and time
+        
+        # if self.node_embeddings is not None:
+        #     # Project (N, raw_dim) -> (N, proj_dim), then broadcast across batch and time
             
-            # emb = self.node_emb_proj(self.node_embeddings)          # (N, proj_dim)
-            # emb = emb.unsqueeze(0).unsqueeze(0).expand(
-            #     x.size(0), x.size(1), -1, -1)                       # (B, T, N, proj_dim)
-            emb = self.node_embeddings.unsqueeze(0).unsqueeze(0).expand(
-                x.size(0), x.size(1), -1, -1)                       # (B, T, N, proj_dim)
+        #     # emb = self.node_emb_proj(self.node_embeddings)          # (N, proj_dim)
+        #     # emb = emb.unsqueeze(0).unsqueeze(0).expand(
+        #     #     x.size(0), x.size(1), -1, -1)                       # (B, T, N, proj_dim)
+        #     emb = self.node_embeddings.unsqueeze(0).unsqueeze(0).expand(
+        #         x.size(0), x.size(1), -1, -1)                       # (B, T, N, proj_dim)
             
-            x = torch.cat([x, emb], dim=-1)                         # (B, T, N, feature_dim+proj_dim)
-        x = x.permute(0, 3, 1, 2)  # (batch_size, feature_dim+emb_dim, input_length, num_nodes)
-        x_st1 = self.st_conv1(x)   # (batch_size, c[2](64), input_length-kt+1-kt+1, num_nodes)
-        x_st2 = self.st_conv2(x_st1)  # (batch_size, c[2](128), input_length-kt+1-kt+1-kt+1-kt+1, num_nodes)
-        outputs = self.output(x_st2)  # (batch_size, output_dim(1), output_length(1), num_nodes)
-        outputs = outputs.permute(0, 2, 3, 1)  # (batch_size, output_length(1), num_nodes, output_dim)
+        #     x = torch.cat([x, emb], dim=-1)                         # (B, T, N, feature_dim+proj_dim)
+        # x = x.permute(0, 3, 1, 2)  # (batch_size, feature_dim+emb_dim, input_length, num_nodes)
+        # x_st1 = self.st_conv1(x)   # (batch_size, c[2](64), input_length-kt+1-kt+1, num_nodes)
+        # x_st2 = self.st_conv2(x_st1)  # (batch_size, c[2](128), input_length-kt+1-kt+1-kt+1-kt+1, num_nodes)
+        # outputs = self.output(x_st2)  # (batch_size, output_dim(1), output_length(1), num_nodes)
+        # outputs = outputs.permute(0, 2, 3, 1)  # (batch_size, output_length(1), num_nodes, output_dim)
+        
+        x = x.permute(0, 3, 1, 2)  # (batch_size, feature_dim, input_length, num_nodes)
+
+        if self._use_node_emb:
+            # Project L2-normalised embeddings → (1, c_spatial, 1, N) bias tensors.
+            # These are added inside SpatioConvLayer after graph aggregation so that
+            # the temporal convolutions only ever see time-varying traffic features.
+            bias1 = self.node_emb_proj1(self.node_embeddings)  # (N, c1)
+            bias1 = bias1.T.unsqueeze(0).unsqueeze(2)          # (1, c1, 1, N)
+            bias2 = self.node_emb_proj2(self.node_embeddings)  # (N, c2)
+            bias2 = bias2.T.unsqueeze(0).unsqueeze(2)          # (1, c2, 1, N)
+        else:
+            bias1 = bias2 = None
+
+        x_st1 = self.st_conv1(x, bias1)    # (B, c[2], T', N)
+        x_st2 = self.st_conv2(x_st1, bias2)  # (B, c[2], T'', N)
+        outputs = self.output(x_st2)          # (B, output_dim, 1, N)
+        outputs = outputs.permute(0, 2, 3, 1)  # (B, 1, N, output_dim)
         return outputs
 
     def calculate_loss(self, batch):

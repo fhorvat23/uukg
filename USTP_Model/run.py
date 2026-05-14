@@ -42,7 +42,7 @@ def _libcity_log_for_exp(exp_id, model, dataset):
 
 
 if __name__ == '__main__':
-    total = 2
+    total = 5
     session_id = uuid.uuid4().hex[:12]
     started_at = datetime.now().isoformat(timespec='seconds')
 
@@ -74,8 +74,26 @@ if __name__ == '__main__':
     base_dict = vars(base_args).copy()
 
     seeds_used = []
+    seeds = [5593,
+    2397,
+    1220,
+    4398,
+    6196]
+    # seeds = [
+    # 4024,
+    # 5680,
+    # 1697,
+    # 6026,
+    # 5595,
+    # 7169,
+    # 7114,
+    # 3823,
+    # 5,
+    # 4185
+    # ]
     for i in range(total):
         seed = random.randint(0, 10000)
+        seed = seeds[i]
         seeds_used.append(seed)
         dict_args = dict(base_dict)
         dict_args['seed'] = seed

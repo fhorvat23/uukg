@@ -604,34 +604,42 @@ class TrafficStateDataset(AbstractDataset):
                     'Run get_embedding.py with --model {} --dataset {} first.'
                     .format(p, self.kg_model, city))
 
-        # Region embeddings: (num_regions, embed_dim) — infer dim from file
+        # Build a reverse map: geo_id (= region_id in the KG files) → node index.
+        # geo_ids are not necessarily 0-based (e.g. NYC uses 2–263), so using a
+        # region_id directly as an array index would produce a systematic offset bug.
+        geo_id_to_node = {int(geo_id): idx for idx, geo_id in enumerate(self.geo_ids)}
+
+        # Region embeddings: (num_regions, embed_dim) — saved row-by-row in the same
+        # sorted order as geo_ids, so a direct row-copy is correct here.
         region_raw = np.load(region_path).astype(np.float32)
         embed_dim = region_raw.shape[1]
         region_emb = np.zeros((num_nodes, embed_dim), dtype=np.float32)
         n = min(region_raw.shape[0], num_nodes)
         region_emb[:n] = region_raw[:n]
 
-        # POI embeddings: (num_pois, embed_dim + 1), last col = region_id
+        # POI embeddings: (num_pois, embed_dim + 1), last col = region_id (geo_id).
+        # Must map region_id → node index before accumulating.
         poi_raw = np.load(poi_path).astype(np.float32)
         poi_emb = np.zeros((num_nodes, embed_dim), dtype=np.float32)
         poi_counts = np.zeros(num_nodes, dtype=np.int32)
         for row in poi_raw:
-            rid = int(row[embed_dim])
-            if 0 <= rid < num_nodes:
-                poi_emb[rid] += row[:embed_dim]
-                poi_counts[rid] += 1
+            node_idx = geo_id_to_node.get(int(row[embed_dim]), -1)
+            if node_idx >= 0:
+                poi_emb[node_idx] += row[:embed_dim]
+                poi_counts[node_idx] += 1
         mask = poi_counts > 0
         poi_emb[mask] /= poi_counts[mask, None]
 
-        # Road embeddings: (num_roads, embed_dim + 1), last col = region_id
+        # Road embeddings: (num_roads, embed_dim + 1), last col = region_id (geo_id).
+        # Same region_id → node index mapping required.
         road_raw = np.load(road_path).astype(np.float32)
         road_emb = np.zeros((num_nodes, embed_dim), dtype=np.float32)
         road_counts = np.zeros(num_nodes, dtype=np.int32)
         for row in road_raw:
-            rid = int(row[embed_dim])
-            if 0 <= rid < num_nodes:
-                road_emb[rid] += row[:embed_dim]
-                road_counts[rid] += 1
+            node_idx = geo_id_to_node.get(int(row[embed_dim]), -1)
+            if node_idx >= 0:
+                road_emb[node_idx] += row[:embed_dim]
+                road_counts[node_idx] += 1
         mask = road_counts > 0
         road_emb[mask] /= road_counts[mask, None]
 
